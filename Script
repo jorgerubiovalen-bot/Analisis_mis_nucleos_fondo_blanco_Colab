@@ -1,0 +1,318 @@
+!pip -q install scikit-image scikit-learn pandas openpyxl matplotlib pillow scipy
+from google.colab import files
+uploaded = files.upload()
+print("Archivos subidos:", list(uploaded.keys()))
+SCRIPT = r'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Análisis de textura para núcleos segmentados sobre fondo blanco.
+
+Entrada:
+- Un ZIP con imágenes PNG/JPG/TIF de núcleos ya segmentados.
+- No necesita test_labels.json.
+
+Salida:
+- CSV y Excel con una fila por núcleo.
+- 4 gráficos generales.
+- Carpeta QC con ejemplos de máscara.
+"""
+
+import io, sys, zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage import color, filters, morphology, measure, feature
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+FEATURES = [
+    "gray_mean","gray_std",
+    "OD_mean","OD_std","OD_CV",
+    "entropy","LBP_entropy",
+    "edge_density","laplacian_var",
+    "OD_border","OD_center","OD_center_minus_border",
+    "glcm_contrast","glcm_dissimilarity",
+    "glcm_homogeneity","glcm_ASM",
+    "glcm_energy","glcm_correlation"
+]
+
+def get_mask(rgb, threshold=20):
+    # Distancia al blanco; el fondo blanco queda fuera.
+    diff = np.linalg.norm(255 - rgb.astype(np.float32), axis=2)
+    raw = diff > threshold
+
+    raw = morphology.remove_small_objects(raw, min_size=20)
+    raw = morphology.closing(raw, morphology.disk(1))
+    raw = ndi.binary_fill_holes(raw)
+
+    lab = measure.label(raw)
+    if lab.max() == 0:
+        return raw.astype(bool)
+
+    counts = np.bincount(lab.ravel())
+    counts[0] = 0
+    largest = counts.max()
+
+    # Conservar componentes relevantes.
+    keep = np.where(counts >= max(20, 0.10 * largest))[0]
+    return np.isin(lab, keep)
+
+def masked_glcm(gray_u8, mask, levels=32):
+    q = np.floor(gray_u8.astype(float) / 256 * levels).astype(int)
+    q = np.clip(q, 0, levels - 1)
+
+    offsets = [(0,1), (1,0), (1,1), (1,-1)]
+    M = np.zeros((levels, levels), dtype=float)
+    h, w = q.shape
+
+    for dy, dx in offsets:
+        if dx >= 0:
+            s1 = (slice(0, h-dy), slice(0, w-dx))
+            s2 = (slice(dy, h), slice(dx, w))
+        else:
+            adx = -dx
+            s1 = (slice(0, h-dy), slice(adx, w))
+            s2 = (slice(dy, h), slice(0, w-adx))
+
+        valid = mask[s1] & mask[s2]
+        a = q[s1][valid]
+        b = q[s2][valid]
+
+        if a.size:
+            np.add.at(M, (a, b), 1)
+            np.add.at(M, (b, a), 1)
+
+    if M.sum() == 0:
+        return {k: np.nan for k in [
+            "glcm_contrast","glcm_dissimilarity","glcm_homogeneity",
+            "glcm_ASM","glcm_energy","glcm_correlation"
+        ]}
+
+    P = M / M.sum()
+    i = np.arange(levels)[:, None]
+    j = np.arange(levels)[None, :]
+
+    contrast = np.sum(P * (i-j)**2)
+    dissimilarity = np.sum(P * np.abs(i-j))
+    homogeneity = np.sum(P / (1 + (i-j)**2))
+    asm = np.sum(P**2)
+    energy = np.sqrt(asm)
+
+    pi, pj = P.sum(axis=1), P.sum(axis=0)
+    mi = np.sum(np.arange(levels) * pi)
+    mj = np.sum(np.arange(levels) * pj)
+    si = np.sqrt(np.sum(((np.arange(levels)-mi)**2) * pi))
+    sj = np.sqrt(np.sum(((np.arange(levels)-mj)**2) * pj))
+    corr = np.sum(P * (i-mi) * (j-mj)) / (si*sj) if si*sj > 0 else np.nan
+
+    return {
+        "glcm_contrast": float(contrast),
+        "glcm_dissimilarity": float(dissimilarity),
+        "glcm_homogeneity": float(homogeneity),
+        "glcm_ASM": float(asm),
+        "glcm_energy": float(energy),
+        "glcm_correlation": float(corr),
+    }
+
+def extract_features(rgb):
+    mask = get_mask(rgb)
+
+    if mask.sum() < 30:
+        return None, mask
+
+    gray = (color.rgb2gray(rgb) * 255).astype(np.uint8)
+    vals = gray[mask].astype(float)
+
+    od = -np.log((vals + 1.0) / 256.0)
+
+    hist, _ = np.histogram(vals, bins=32, range=(0,256))
+    p = hist / hist.sum()
+    p = p[p > 0]
+    entropy = float(-(p*np.log2(p)).sum())
+
+    lbp = feature.local_binary_pattern(gray, P=8, R=1, method="uniform")
+    lh, _ = np.histogram(lbp[mask], bins=np.arange(0,11))
+    lp = lh / lh.sum()
+    lp = lp[lp > 0]
+    lbp_entropy = float(-(lp*np.log2(lp)).sum())
+
+    sob = filters.sobel(gray.astype(float)/255.0)
+    lap = ndi.laplace(gray.astype(float)/255.0)
+
+    dist = ndi.distance_transform_edt(mask)
+    d = dist[mask]
+    q25, q75 = np.quantile(d, [0.25,0.75])
+    border = mask & (dist <= q25)
+    center = mask & (dist >= q75)
+
+    def od_mean(m):
+        v = gray[m].astype(float)
+        if not v.size:
+            return np.nan
+        return float(np.mean(-np.log((v+1.0)/256.0)))
+
+    row = {
+        "nucleus_pixels": int(mask.sum()),
+        "gray_mean": float(vals.mean()),
+        "gray_std": float(vals.std()),
+        "OD_mean": float(od.mean()),
+        "OD_std": float(od.std()),
+        "OD_CV": float(od.std()/od.mean()) if od.mean() > 0 else np.nan,
+        "entropy": entropy,
+        "LBP_entropy": lbp_entropy,
+        "edge_density": float(sob[mask].mean()),
+        "laplacian_var": float(lap[mask].var()),
+        "OD_border": od_mean(border),
+        "OD_center": od_mean(center),
+        "OD_center_minus_border": float(od_mean(center)-od_mean(border))
+    }
+
+    row.update(masked_glcm(gray, mask))
+    return row, mask
+
+def main(zip_path, out_dir):
+    zip_path = Path(zip_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir = out_dir / "QC_masks"
+    qc_dir.mkdir(exist_ok=True)
+
+    rows = []
+    qc_saved = 0
+
+    with zipfile.ZipFile(zip_path) as z:
+        image_names = [
+            n for n in z.namelist()
+            if (not n.endswith("/")) and Path(n).suffix.lower() in IMAGE_EXTS
+        ]
+
+        print("Imágenes encontradas:", len(image_names))
+
+        for i, n in enumerate(image_names, 1):
+            try:
+                rgb = np.asarray(Image.open(io.BytesIO(z.read(n))).convert("RGB"))
+                feat, mask = extract_features(rgb)
+
+                if feat is None:
+                    continue
+
+                image_id = Path(n).stem
+                feat["id"] = image_id
+                feat["filename"] = Path(n).name
+                feat["folder"] = str(Path(n).parent)
+                rows.append(feat)
+
+                # Guardar ejemplos de control de calidad.
+                if qc_saved < 12:
+                    fig = plt.figure(figsize=(6,3))
+                    ax1 = fig.add_subplot(1,2,1)
+                    ax1.imshow(rgb)
+                    ax1.set_title("Original")
+                    ax1.axis("off")
+                    ax2 = fig.add_subplot(1,2,2)
+                    ax2.imshow(mask, cmap="gray")
+                    ax2.set_title("Máscara analizada")
+                    ax2.axis("off")
+                    fig.tight_layout()
+                    fig.savefig(qc_dir / f"QC_{image_id}.png", dpi=150, bbox_inches="tight")
+                    plt.close(fig)
+                    qc_saved += 1
+
+            except Exception as e:
+                print("Error:", n, e)
+
+            if i % 100 == 0:
+                print(f"Procesadas {i}/{len(image_names)}")
+
+    df = pd.DataFrame(rows).sort_values("id").reset_index(drop=True)
+
+    # Exportar tabla.
+    df.to_csv(out_dir / "Textura_nuclear.csv", index=False)
+    df.to_excel(out_dir / "Textura_nuclear.xlsx", index=False)
+
+    # Figura 1: correlaciones.
+    corr = df[FEATURES].corr(method="spearman")
+    fig = plt.figure(figsize=(12,10))
+    ax = fig.add_subplot(111)
+    im = ax.imshow(corr.values, vmin=-1, vmax=1)
+    ax.set_xticks(range(len(FEATURES)))
+    ax.set_yticks(range(len(FEATURES)))
+    ax.set_xticklabels(FEATURES, rotation=90)
+    ax.set_yticklabels(FEATURES)
+    ax.set_title("Correlación entre variables de textura")
+    cb = fig.colorbar(im, ax=ax)
+    cb.set_label("Spearman rho")
+    fig.tight_layout()
+    fig.savefig(out_dir / "Figura_1_correlaciones_textura.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # Figura 2: PCA.
+    X = df[FEATURES].replace([np.inf,-np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True))
+    Xs = StandardScaler().fit_transform(X)
+    pca = PCA(n_components=2)
+    pcs = pca.fit_transform(Xs)
+
+    fig = plt.figure(figsize=(8,7))
+    ax = fig.add_subplot(111)
+    ax.scatter(pcs[:,0], pcs[:,1], s=18, alpha=0.65)
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]*100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]*100:.1f}%)")
+    ax.set_title("PCA de textura nuclear")
+    fig.tight_layout()
+    fig.savefig(out_dir / "Figura_2_PCA_textura.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # Figura 3: distribución OD.
+    fig = plt.figure(figsize=(8,6))
+    ax = fig.add_subplot(111)
+    ax.hist(df["OD_mean"].dropna(), bins=30)
+    ax.set_xlabel("OD media")
+    ax.set_ylabel("Número de núcleos")
+    ax.set_title("Distribución de densidad óptica nuclear")
+    fig.tight_layout()
+    fig.savefig(out_dir / "Figura_3_distribucion_OD.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    # Figura 4: entropía vs homogeneidad.
+    fig = plt.figure(figsize=(8,6))
+    ax = fig.add_subplot(111)
+    ax.scatter(df["entropy"], df["glcm_homogeneity"], s=18, alpha=0.65)
+    ax.set_xlabel("Entropía")
+    ax.set_ylabel("Homogeneidad GLCM")
+    ax.set_title("Complejidad vs homogeneidad de la cromatina")
+    fig.tight_layout()
+    fig.savefig(out_dir / "Figura_4_entropia_vs_homogeneidad.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print("Núcleos analizados:", len(df))
+    print("Resultados guardados en:", out_dir)
+
+if __name__ == "__main__":
+    zip_path = sys.argv[1] if len(sys.argv) > 1 else "mis_nucleos.zip"
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else "resultados_mis_nucleos"
+    main(zip_path, out_dir)
+'''
+open('analisis_mis_nucleos_fondo_blanco.py','w',encoding='utf-8').write(SCRIPT)
+print('Script preparado.')
+
+
+# CAMBIA este nombre si tu ZIP se llama distinto
+ZIP_NAME = list(uploaded.keys())[0]
+
+!python analisis_mis_nucleos_fondo_blanco.py "$ZIP_NAME" resultados_mis_nucleos
+
+
+import shutil
+shutil.make_archive("resultados_mis_nucleos", "zip", "resultados_mis_nucleos")
+
+from google.colab import files
+files.download("resultados_mis_nucleos.zip")
+
